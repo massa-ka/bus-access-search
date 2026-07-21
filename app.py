@@ -58,9 +58,9 @@ def search_nearby(lat, lon, radius, day_col, stops, stop_routes):
 
     detail = nearby.merge(stop_routes, on="stop_id", how="left")
     detail = detail.loc[detail[day_col].fillna(0) > 0].copy()
-    detail["事業者"] = detail["agency_name"].fillna("不明")
-    detail["営業所"] = detail["office_name"].fillna("不明")
-    detail["系統"] = detail["route_short_name"].fillna(detail["route_id"])
+    detail["事業者"] = detail["agency_name"].fillna("事業者情報なし")
+    detail["営業所"] = detail["office_name"].fillna("営業所情報なし")
+    detail["系統"] = detail["route_short_name"].fillna(detail["route_long_name"]).fillna(detail["route_id"])
     detail["行先"] = detail["trip_headsign"].fillna("—")
 
     # Same named stop may have separate poles/directions. Present one row per name and route.
@@ -88,7 +88,7 @@ def excel_bytes(summary, routes):
 
 
 st.title("🚌 バスアクセスサーチ")
-st.caption("住所または緯度・経度を起点に、指定した直線距離内の都営バス停留所と系統を検索します。")
+st.caption("住所または緯度・経度を起点に、指定した直線距離内のバス停留所と系統を事業者横断で検索します。")
 stops, stop_routes = load_data()
 
 with st.sidebar:
@@ -136,7 +136,7 @@ if st.session_state.point:
     nearby, summary, route_rows = search_nearby(lat, lon, radius, day_col, stops, stop_routes)
     st.subheader(point_label)
     if summary.empty:
-        st.info(f"半径{radius:,}m以内に、{day_name}に運行する都営バス停留所が見つかりませんでした。")
+        st.info(f"半径{radius:,}m以内に、{day_name}に運行するバス停留所が見つかりませんでした。")
     else:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("停留所", f"{summary['stop_name'].nunique():,}か所")
@@ -144,11 +144,12 @@ if st.session_state.point:
         m3.metric("系統", f"{route_rows['系統'].nunique():,}系統")
         m4.metric(f"{day_name}便数（停車回数）", f"{route_rows['便数'].sum():,.0f}便")
 
-        map_points = nearby[["stop_lat", "stop_lon", "stop_name"]].rename(
+        map_points = nearby[["stop_lat", "stop_lon", "stop_name", "agency_name"]].rename(
             columns={"stop_lat": "lat", "stop_lon": "lon"}
         ).drop_duplicates()
         map_points["種類"] = "バス停"
-        origin = pd.DataFrame([{"lat": lat, "lon": lon, "stop_name": "検索地点", "種類": "検索地点"}])
+        map_points["表示名"] = map_points["stop_name"] + "<br>" + map_points["agency_name"]
+        origin = pd.DataFrame([{"lat": lat, "lon": lon, "stop_name": "検索地点", "表示名": "検索地点", "種類": "検索地点"}])
         stop_layer = pdk.Layer(
             "ScatterplotLayer", map_points, get_position="[lon, lat]",
             get_radius=7, radius_min_pixels=7, radius_max_pixels=7,
@@ -167,7 +168,7 @@ if st.session_state.point:
             map_style="light",
             initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=14.2, pitch=0),
             layers=[stop_layer, origin_layer],
-            tooltip={"html": "<b>{種類}</b><br>{stop_name}"},
+            tooltip={"html": "<b>{種類}</b><br>{表示名}"},
         ), use_container_width=True)
 
         tab1, tab2 = st.tabs(["停留所一覧", "路線・行先"])
