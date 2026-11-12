@@ -40,10 +40,28 @@ def distance_km(lat1, lon1, lat2, lon2):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def geocode(query):
+    # 日本の住所表記に強い国土地理院の住所検索を優先する。
+    r = requests.get(
+        "https://msearch.gsi.go.jp/address-search/AddressSearch",
+        params={"q": query}, timeout=15,
+    )
+    r.raise_for_status()
+    hits = []
+    for feature in r.json()[:5]:
+        lon, lat = feature["geometry"]["coordinates"]
+        hits.append({
+            "display_name": feature.get("properties", {}).get("title", query),
+            "lat": str(lat),
+            "lon": str(lon),
+        })
+    if hits:
+        return hits
+
+    # 国土地理院で見つからない場合のみ、従来の検索を補助的に利用する。
     r = requests.get(
         "https://nominatim.openstreetmap.org/search",
         params={"q": query, "format": "json", "limit": 5, "countrycodes": "jp"},
-        headers={"User-Agent": "bus-access-search/1.0"}, timeout=15,
+        headers={"User-Agent": "bus-access-search/1.1"}, timeout=15,
     )
     r.raise_for_status()
     return r.json()
@@ -76,6 +94,8 @@ with st.sidebar:
         address = st.text_input("住所", placeholder="例：東京都新宿区西新宿2丁目8-1")
         search = st.button("検索", type="primary", use_container_width=True)
         if search and address:
+            # 検索失敗時に、以前の検索候補を残さない。
+            st.session_state.pop("geo_hits", None)
             try:
                 hits = geocode(address)
                 if hits:
@@ -113,10 +133,26 @@ map_stops = near.copy()
 map_stops["tooltip"] = map_stops["stop_name"] + "<br>" + map_stops["agency"] + "<br>検索地点から " + map_stops["distance_m"].astype(str) + "m"
 point = pd.DataFrame([{"stop_lat": lat, "stop_lon": lon}])
 layers = [
-    pdk.Layer("ScatterplotLayer", map_stops, get_position="[stop_lon, stop_lat]", get_radius=45, get_fill_color=[30, 115, 230, 210], pickable=True),
-    pdk.Layer("ScatterplotLayer", point, get_position="[stop_lon, stop_lat]", get_radius=75, get_fill_color=[230, 35, 45, 255]),
+    pdk.Layer(
+        "ScatterplotLayer", map_stops, get_position="[stop_lon, stop_lat]",
+        get_radius=5, radius_units="pixels", radius_min_pixels=4, radius_max_pixels=7,
+        get_fill_color=[30, 115, 230, 210], pickable=True,
+    ),
+    pdk.Layer(
+        "ScatterplotLayer", point, get_position="[stop_lon, stop_lat]",
+        get_radius=7, radius_units="pixels", radius_min_pixels=6, radius_max_pixels=9,
+        get_fill_color=[230, 35, 45, 255],
+    ),
 ]
-st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=13), tooltip={"html": "{tooltip}"}), use_container_width=True)
+st.pydeck_chart(
+    pdk.Deck(
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=13),
+        tooltip={"html": "{tooltip}"},
+    ),
+    use_container_width=True,
+)
 st.markdown('<div class="small-note">赤：検索地点　青：停留所　※距離は直線距離です。</div>', unsafe_allow_html=True)
 
 stops_view = near[["agency", "stop_name", "distance_m"]].rename(columns={"agency":"事業者", "stop_name":"停留所", "distance_m":"距離（m）"})
