@@ -1,185 +1,137 @@
-import io
-import json
-import math
-import urllib.parse
-import urllib.request
+from __future__ import annotations
+
+from io import BytesIO
+from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 
 import pandas as pd
 import pydeck as pdk
+import requests
 import streamlit as st
-
-
-ROOT = Path(__file__).resolve().parent
-DATA = ROOT
-DAY_LABELS = {
-    "平日（月～金） / Weekday": "weekday",
-    "土曜 / Saturday": "saturday",
-    "休日（日曜・祝日） / Holiday": "holiday",
-}
-DAY_NAMES = {"weekday": "平日", "saturday": "土曜", "holiday": "休日"}
 
 
 st.set_page_config(page_title="バスアクセスサーチ", page_icon="🚌", layout="wide")
 
+st.markdown("""
+<style>
+.block-container {padding-top: 2rem; padding-bottom: 3rem;}
+div[data-testid="stMetric"] {background:#f6f8fa;border:1px solid #e6e9ed;border-radius:12px;padding:14px 18px;}
+.small-note {color:#667085;font-size:.9rem;}
+</style>
+""", unsafe_allow_html=True)
+
 
 @st.cache_data
 def load_data():
-    stops = pd.read_csv(DATA / "stops.csv.gz", dtype={"stop_id": str})
-    stop_routes = pd.read_csv(DATA / "stop_routes.csv.gz", dtype={"stop_id": str, "route_id": str})
-    return stops, stop_routes
+    base = Path(__file__).parent
+    stops = pd.read_csv(base / "stops.csv.gz", dtype={"stop_uid": str})
+    routes = pd.read_csv(base / "stop_routes.csv.gz", dtype={"stop_uid": str})
+    return stops, routes
 
 
+def distance_km(lat1, lon1, lat2, lon2):
+    lat1, lon1 = radians(lat1), radians(lon1)
+    lat2 = lat2.astype(float).map(radians)
+    lon2 = lon2.astype(float).map(radians)
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = dlat.map(lambda x: sin(x / 2) ** 2) + lat2.map(cos) * cos(lat1) * dlon.map(lambda x: sin(x / 2) ** 2)
+    return 6371.0088 * 2 * a.map(lambda x: asin(sqrt(min(1, x))))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def geocode(query):
-    url = "https://msearch.gsi.go.jp/address-search/AddressSearch?q=" + urllib.parse.quote(query)
-    req = urllib.request.Request(url, headers={"User-Agent": "BusAccessSearch-Prototype/0.1"})
-    with urllib.request.urlopen(req, timeout=10) as response:
-        return json.load(response)
+    r = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": query, "format": "json", "limit": 5, "countrycodes": "jp"},
+        headers={"User-Agent": "bus-access-search/1.0"}, timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
 
 
-def distances_m(lat, lon, stop_lats, stop_lons):
-    # Haversine formula: straight-line distance on Earth.
-    lat1 = math.radians(lat)
-    lon1 = math.radians(lon)
-    lat2 = stop_lats.map(math.radians)
-    lon2 = stop_lons.map(math.radians)
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = (dlat / 2).map(math.sin) ** 2 + math.cos(lat1) * lat2.map(math.cos) * (dlon / 2).map(math.sin) ** 2
-    return 6371000 * 2 * a.map(math.sqrt).map(math.asin)
-
-
-def search_nearby(lat, lon, radius, day_col, stops, stop_routes):
-    nearby = stops.copy()
-    nearby["距離(m)"] = distances_m(lat, lon, nearby["stop_lat"], nearby["stop_lon"]).round().astype(int)
-    nearby = nearby.loc[nearby["距離(m)"] <= radius].copy()
-    if nearby.empty:
-        return nearby, pd.DataFrame(), pd.DataFrame()
-
-    detail = nearby.merge(stop_routes, on="stop_id", how="left")
-    detail = detail.loc[detail[day_col].fillna(0) > 0].copy()
-    detail["事業者"] = detail["agency_name"].fillna("事業者情報なし")
-    detail["営業所"] = detail["office_name"].fillna("営業所情報なし")
-    detail["系統"] = detail["route_short_name"].fillna(detail["route_long_name"]).fillna(detail["route_id"])
-    detail["行先"] = detail["trip_headsign"].fillna("—")
-
-    # Same named stop may have separate poles/directions. Present one row per name and route.
-    route_rows = detail.groupby(["stop_name", "事業者", "営業所", "系統", "行先"], as_index=False).agg(
-        **{"距離(m)": ("距離(m)", "min"), "便数": (day_col, "sum")}
-    ).sort_values(["距離(m)", "stop_name", "系統", "行先"])
-    summary = route_rows.groupby("stop_name", as_index=False).agg(
-        **{
-            "距離(m)": ("距離(m)", "min"),
-            "事業者": ("事業者", lambda x: "、".join(sorted(set(x)))),
-            "営業所": ("営業所", lambda x: "、".join(sorted(set(x)))),
-            "系統数": ("系統", "nunique"),
-            "便数": ("便数", "sum"),
-        }
-    ).sort_values("距離(m)")
-    return nearby, summary, route_rows
-
-
-def excel_bytes(summary, routes):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary.to_excel(writer, sheet_name="停留所一覧", index=False)
-        routes.to_excel(writer, sheet_name="路線・行先", index=False)
-    return output.getvalue()
+def excel_bytes(stops_df, routes_df):
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        stops_df.to_excel(writer, sheet_name="停留所一覧", index=False)
+        routes_df.to_excel(writer, sheet_name="路線・行先", index=False)
+    return out.getvalue()
 
 
 st.title("🚌 バスアクセスサーチ")
-st.caption("住所または緯度・経度を起点に、指定した直線距離内のバス停留所と系統を事業者横断で検索します。")
-stops, stop_routes = load_data()
+st.caption("住所または緯度・経度を起点に、周辺の停留所・系統・行先・営業所・便数を検索します。")
+
+stops, route_data = load_data()
 
 with st.sidebar:
     st.header("検索条件")
-    mode = st.radio("地点の指定方法", ["住所検索", "緯度・経度"], horizontal=True)
-    radius = st.selectbox("検索半径", [300, 500, 1000], index=1, format_func=lambda x: f"{x:,}m")
-    day_label = st.selectbox("曜日", list(DAY_LABELS), index=0)
-    st.caption("文字が別の語に変わる場合は、ブラウザの自動翻訳をオフにしてください。")
+    mode = st.radio("検索方法", ["住所から検索", "緯度・経度から検索"])
+    radius_m = st.selectbox("検索半径", [300, 500, 1000, 1500, 2000], index=1, format_func=lambda x: f"{x:,}m")
+    day_label = st.selectbox("曜日", ["平日", "土曜", "休日"])
+    day_col = {"平日": "weekday", "土曜": "saturday", "休日": "holiday"}[day_label]
+    agency_choices = sorted(stops["agency"].dropna().unique())
+    agencies = st.multiselect("バス事業者", agency_choices, default=agency_choices)
 
-if "point" not in st.session_state:
-    st.session_state.point = None
-
-if mode == "住所検索":
-    query = st.text_input("住所", placeholder="例：東京都新宿区西新宿2丁目8-1")
-    if st.button("住所を検索", type="primary") and query:
-        # A new address search invalidates the previously confirmed point/result.
-        st.session_state.point = None
-        st.session_state.candidates = []
-        try:
-            candidates = geocode(query)
-            if candidates:
-                st.session_state.candidates = candidates
-            else:
-                st.warning("候補が見つかりませんでした。住所を詳しく入力してください。")
-        except Exception as exc:
-            st.error(f"住所検索に接続できませんでした。緯度・経度入力をお試しください。（{exc}）")
-    candidates = st.session_state.get("candidates", [])
-    if candidates:
-        labels = [x["properties"].get("title", "候補") for x in candidates]
-        selected = st.selectbox("地点候補", range(len(labels)), format_func=lambda i: labels[i])
-        if st.button("この地点でバス停を検索"):
-            lon, lat = candidates[selected]["geometry"]["coordinates"]
-            st.session_state.point = (float(lat), float(lon), labels[selected])
-else:
-    c1, c2 = st.columns(2)
-    lat = c1.number_input("緯度", value=35.689501, format="%.6f")
-    lon = c2.number_input("経度", value=139.691722, format="%.6f")
-    if st.button("この地点でバス停を検索", type="primary"):
-        st.session_state.point = (lat, lon, f"緯度 {lat:.6f}, 経度 {lon:.6f}")
-
-if st.session_state.point:
-    lat, lon, point_label = st.session_state.point
-    day_col = DAY_LABELS[day_label]
-    day_name = DAY_NAMES[day_col]
-    nearby, summary, route_rows = search_nearby(lat, lon, radius, day_col, stops, stop_routes)
-    st.subheader(point_label)
-    if summary.empty:
-        st.info(f"半径{radius:,}m以内に、{day_name}に運行するバス停留所が見つかりませんでした。")
+    lat = lon = None
+    if mode == "住所から検索":
+        address = st.text_input("住所", placeholder="例：東京都新宿区西新宿2丁目8-1")
+        search = st.button("検索", type="primary", use_container_width=True)
+        if search and address:
+            try:
+                hits = geocode(address)
+                if hits:
+                    st.session_state["geo_hits"] = hits
+                else:
+                    st.error("住所を特定できませんでした。番地まで入力するか、緯度・経度検索をお試しください。")
+            except Exception:
+                st.error("住所検索サービスへ接続できませんでした。時間を置いて再度お試しください。")
+        hits = st.session_state.get("geo_hits", [])
+        if hits:
+            selected = st.selectbox("検索地点の候補", range(len(hits)), format_func=lambda i: hits[i]["display_name"])
+            lat, lon = float(hits[selected]["lat"]), float(hits[selected]["lon"])
     else:
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("停留所", f"{summary['stop_name'].nunique():,}か所")
-        m2.metric("事業者", f"{route_rows['事業者'].nunique():,}社")
-        m3.metric("系統", f"{route_rows['系統'].nunique():,}系統")
-        m4.metric(f"{day_name}便数（停車回数）", f"{route_rows['便数'].sum():,.0f}便")
+        lat = st.number_input("緯度", value=35.6895, format="%.6f")
+        lon = st.number_input("経度", value=139.6917, format="%.6f")
+        st.button("検索", type="primary", use_container_width=True)
 
-        map_points = nearby[["stop_lat", "stop_lon", "stop_name", "agency_name"]].rename(
-            columns={"stop_lat": "lat", "stop_lon": "lon"}
-        ).drop_duplicates()
-        map_points["種類"] = "バス停"
-        map_points["表示名"] = map_points["stop_name"] + "<br>" + map_points["agency_name"]
-        origin = pd.DataFrame([{"lat": lat, "lon": lon, "stop_name": "検索地点", "表示名": "検索地点", "種類": "検索地点"}])
-        stop_layer = pdk.Layer(
-            "ScatterplotLayer", map_points, get_position="[lon, lat]",
-            get_radius=7, radius_min_pixels=7, radius_max_pixels=7,
-            get_fill_color=[30, 115, 230, 210],
-            get_line_color=[255, 255, 255, 230], stroked=True, line_width_min_pixels=1,
-            pickable=True,
-        )
-        origin_layer = pdk.Layer(
-            "ScatterplotLayer", origin, get_position="[lon, lat]",
-            get_radius=11, radius_min_pixels=11, radius_max_pixels=11,
-            get_fill_color=[230, 35, 45, 255],
-            get_line_color=[255, 255, 255, 255], stroked=True, line_width_min_pixels=3,
-            pickable=True,
-        )
-        st.pydeck_chart(pdk.Deck(
-            map_style="light",
-            initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=14.2, pitch=0),
-            layers=[stop_layer, origin_layer],
-            tooltip={"html": "<b>{種類}</b><br>{表示名}"},
-        ), use_container_width=True)
+if lat is None or lon is None:
+    st.info("左側で住所を入力して「検索」を押してください。")
+    st.stop()
 
-        tab1, tab2 = st.tabs(["停留所一覧", "路線・行先"])
-        with tab1:
-            st.dataframe(summary.rename(columns={"stop_name": "停留所名"}), hide_index=True, use_container_width=True)
-        with tab2:
-            st.dataframe(route_rows.rename(columns={"stop_name": "停留所名"}), hide_index=True, use_container_width=True)
-        st.download_button(
-            "Excelをダウンロード", excel_bytes(summary.rename(columns={"stop_name": "停留所名"}), route_rows.rename(columns={"stop_name": "停留所名"})),
-            file_name="bus_access_search.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+candidate = stops[stops["agency"].isin(agencies)].copy()
+candidate["distance_m"] = (distance_km(lat, lon, candidate["stop_lat"], candidate["stop_lon"]) * 1000).round().astype(int)
+near = candidate[candidate["distance_m"] <= radius_m].sort_values(["distance_m", "agency", "stop_name"])
+detail = near.merge(route_data, on=["stop_uid", "agency"], how="left")
+detail = detail[detail[day_col].fillna(0) > 0].copy()
 
-st.divider()
-st.caption("試作版：住所検索専用です。距離は直線距離です。便数はGTFSの標準的な曜日設定から集計し、臨時の運休・増便は反映していません。住所検索には国土地理院の検索機能を使用します。")
+metrics = st.columns(4)
+metrics[0].metric("停留所", f"{near['stop_uid'].nunique():,}")
+metrics[1].metric("事業者", f"{near['agency'].nunique():,}")
+metrics[2].metric("系統", f"{detail['route'].nunique():,}")
+metrics[3].metric(f"{day_label}便数（停車回数）", f"{int(detail[day_col].sum()):,}")
+
+map_stops = near.copy()
+map_stops["tooltip"] = map_stops["stop_name"] + "<br>" + map_stops["agency"] + "<br>検索地点から " + map_stops["distance_m"].astype(str) + "m"
+point = pd.DataFrame([{"stop_lat": lat, "stop_lon": lon}])
+layers = [
+    pdk.Layer("ScatterplotLayer", map_stops, get_position="[stop_lon, stop_lat]", get_radius=45, get_fill_color=[30, 115, 230, 210], pickable=True),
+    pdk.Layer("ScatterplotLayer", point, get_position="[stop_lon, stop_lat]", get_radius=75, get_fill_color=[230, 35, 45, 255]),
+]
+st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=13), tooltip={"html": "{tooltip}"}), use_container_width=True)
+st.markdown('<div class="small-note">赤：検索地点　青：停留所　※距離は直線距離です。</div>', unsafe_allow_html=True)
+
+stops_view = near[["agency", "stop_name", "distance_m"]].rename(columns={"agency":"事業者", "stop_name":"停留所", "distance_m":"距離（m）"})
+routes_view = detail[["agency", "stop_name", "distance_m", "route", "headsign", "office", day_col]].rename(columns={
+    "agency":"事業者", "stop_name":"停留所", "distance_m":"距離（m）", "route":"系統", "headsign":"行先", "office":"営業所", day_col:f"{day_label}便数"
+}).sort_values(["距離（m）", "事業者", "停留所", "系統", "行先"])
+
+tab1, tab2 = st.tabs(["停留所一覧", "路線・行先"])
+with tab1:
+    st.dataframe(stops_view, use_container_width=True, hide_index=True)
+with tab2:
+    st.dataframe(routes_view, use_container_width=True, hide_index=True)
+
+st.download_button("Excelをダウンロード", excel_bytes(stops_view, routes_view), "bus_access_search.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+with st.expander("収録データについて"):
+    st.write("対応事業者：都営バス、横浜市営バス、西武バス、北海道中央バス")
+    st.write("便数は各GTFSの曜日設定に基づく停車回数です。臨時の運休・増便等は反映されない場合があります。")
